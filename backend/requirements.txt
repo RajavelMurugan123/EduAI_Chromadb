@@ -1,0 +1,17 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+psycopg2-binary
+python-jose[cryptography]
+passlib[bcrypt]
+bcrypt==4.0.1
+pydantic[email]
+python-dotenv
+python-multipart
+celery
+redis
+openai-whisper
+sentence-transformers
+google-genai
+psycopg2-binary
+chromadb
