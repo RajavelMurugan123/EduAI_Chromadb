@@ -45,7 +45,7 @@ def build_context_and_prompt(db, video_id, user_id, message, top_k=10):
     scored.sort(key=lambda x: x[0], reverse=True)
 
     top_scored = scored[:top_k]
-    top_segments = sorted(top_scored, key=lambda x: x[1])  # chronological for readable context
+    top_segments = sorted(top_scored, key=lambda x: x[1])
 
     relevant_segments = [s for s in top_scored if s[0] >= MIN_RELEVANCE_SCORE]
     relevant_segments.sort(key=lambda x: x[1])
@@ -80,8 +80,6 @@ New question: {message}
 
 Answer:"""
 
-    # Package "segments" as simple objects with a .start_time attribute,
-    # matching what the rest of this file expects.
     class _Seg:
         def __init__(self, start_time):
             self.start_time = start_time
@@ -142,7 +140,12 @@ def chat_with_video(
     if prompt is None:
         raise HTTPException(status_code=400, detail="This video has no transcript yet")
 
-    answer = call_llm(prompt)
+    try:
+        answer = call_llm(prompt)
+    except Exception as e:
+        print(f"[chat failed]: {e}")
+        raise HTTPException(status_code=503, detail="Couldn't answer that right now. Please try again in a moment.")
+
     timestamps = [s.start_time for s in relevant_segments]
 
     db.add(ChatMessage(user_id=current_user.id, video_id=video_id, role="user", text=payload.message))
@@ -184,6 +187,11 @@ def chat_with_video_stream(
                 if chunk.text:
                     full_answer += chunk.text
                     yield chunk.text
+        except Exception as e:
+            print(f"[chat stream failed]: {e}")
+            error_message = "Sorry, I couldn't answer that right now. Please try again in a moment."
+            full_answer = error_message
+            yield error_message
         finally:
             save_db = SessionLocal()
             try:
@@ -229,7 +237,12 @@ Transcript:
 
 Summary:"""
 
-    summary = call_llm(prompt)
+    try:
+        summary = call_llm(prompt)
+    except Exception as e:
+        print(f"[summary failed]: {e}")
+        raise HTTPException(status_code=503, detail="Couldn't generate a summary right now. Please try again in a moment.")
+
     video.cached_summary = summary
     db.commit()
     return {"summary": summary}
@@ -242,16 +255,10 @@ def related_videos(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Cross-video similarity using Chroma: fetch this video's segment vectors
-    via a broad query against itself, average them, then compare against
-    other videos' averaged vectors the same way.
-    """
     collection = get_collection()
 
-    # Get ALL of this video's stored vectors directly from Chroma
     this_video_data = collection.get(where={"video_id": str(video_id)}, include=["embeddings"])
-    if not this_video_data["embeddings"]:
+    if this_video_data["embeddings"] is None or len(this_video_data["embeddings"]) == 0:
         return []
 
     target_avg = np.mean(this_video_data["embeddings"], axis=0)
@@ -261,7 +268,7 @@ def related_videos(
     scored = []
     for v in other_videos:
         v_data = collection.get(where={"video_id": str(v.id)}, include=["embeddings"])
-        if not v_data["embeddings"]:
+        if v_data["embeddings"] is None or len(v_data["embeddings"]) == 0:
             continue
         v_avg = np.mean(v_data["embeddings"], axis=0)
         score = float(np.dot(target_avg, v_avg) / (np.linalg.norm(target_avg) * np.linalg.norm(v_avg)))
@@ -306,7 +313,12 @@ Transcript:
 
 Questions:"""
 
-    raw = call_llm(prompt)
+    try:
+        raw = call_llm(prompt)
+    except Exception as e:
+        print(f"[suggested-questions failed]: {e}")
+        return {"questions": []}
+
     questions = [q.strip("- ").strip() for q in raw.strip().split("\n") if q.strip()][:3]
 
     video.cached_suggested_questions = json.dumps(questions)
