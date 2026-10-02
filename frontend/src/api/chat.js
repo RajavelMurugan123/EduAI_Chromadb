@@ -24,11 +24,7 @@ export async function getSuggestedQuestions(videoId) {
   return response.data;
 }
 
-/**
- * Streams a chat response. Calls onChunk(text) as tokens arrive,
- * and onMeta(referencedTimestamps) once, before streaming starts.
- */
-export async function streamChatMessage(videoId, message, currentTimestamp, { onMeta, onChunk }) {
+export async function streamChatMessage(videoId, message, currentTimestamp, { onMeta, onRelated, onChunk }) {
   const token = localStorage.getItem("token");
   const baseURL = api.defaults.baseURL;
 
@@ -49,6 +45,7 @@ export async function streamChatMessage(videoId, message, currentTimestamp, { on
   const decoder = new TextDecoder();
   let buffer = "";
   let metaHandled = false;
+  let relatedHandled = false;
 
   while (true) {
     const { done, value } = await reader.read();
@@ -69,9 +66,32 @@ export async function streamChatMessage(videoId, message, currentTimestamp, { on
           onMeta?.([]);
         }
       }
-      if (buffer) {
-        onChunk(buffer);
-        buffer = "";
+      continue;
+    }
+
+    if (!relatedHandled) {
+      const newlineIndex = buffer.indexOf("\n");
+      if (newlineIndex === -1) continue;
+      const line = buffer.slice(0, newlineIndex);
+      relatedHandled = true;
+      if (line.startsWith("RELATED:")) {
+        buffer = buffer.slice(newlineIndex + 1);
+        try {
+          const related = JSON.parse(line.slice(8));
+          onRelated?.(related);
+        } catch {
+          onRelated?.([]);
+        }
+        if (buffer) {
+          onChunk(buffer);
+          buffer = "";
+        }
+      } else {
+        // Not a RELATED line — it's the start of real answer text, keep it.
+        if (buffer) {
+          onChunk(buffer);
+          buffer = "";
+        }
       }
       continue;
     }

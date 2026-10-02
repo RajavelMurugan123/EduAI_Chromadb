@@ -12,12 +12,62 @@ from app.models import User, TranscriptSegment, Video, VideoStatus, ChatMessage
 from app.auth import get_current_user
 from app.services.embeddings import embed_text
 from app.services.vector_store import query_segments, get_collection
-from app.services.llm import call_llm, get_gemini_client, MODEL_NAME
+from app.services.llm import call_llm, stream_llm, get_client, MODEL_NAME
 
 router = APIRouter(prefix="/videos", tags=["chat"])
 
 HISTORY_TURNS = 6
 MIN_RELEVANCE_SCORE = 0.35
+
+INTENT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "summarize_video",
+            "description": "Call this ONLY when the user explicitly wants an overview, summary, or TL;DR of the entire video's content — not for a question about a specific detail or moment.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_related_videos",
+            "description": "Call this ONLY when the user wants recommendations for OTHER videos related to or similar to this one — not for a question about the content of this video itself.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "suggest_questions",
+            "description": "Call this ONLY when the user is asking WHAT they could ask about this video (e.g. 'what should I ask', 'give me some question ideas') — not when they're asking an actual question themselves.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+]
+
+
+def classify_intent(message: str) -> str:
+    client = get_client()
+    try:
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": message}],
+            tools=INTENT_TOOLS,
+            tool_choice="auto",
+        )
+        tool_calls = response.choices[0].message.tool_calls
+        if tool_calls:
+            name = tool_calls[0].function.name
+            if name == "summarize_video":
+                return "summarize"
+            if name == "find_related_videos":
+                return "related"
+            if name == "suggest_questions":
+                return "suggest_questions"
+    except Exception as e:
+        print(f"[intent classification failed]: {e}")
+    return "answer"
 
 
 class ChatRequest(BaseModel):
@@ -87,6 +137,35 @@ Answer:"""
     relevant_seg_objs = [_Seg(start) for _, start, _ in relevant_segments]
 
     return prompt, top_segments, relevant_seg_objs
+
+
+def get_related_videos_data(db, video_id, top_k=4):
+    collection = get_collection()
+
+    this_video_data = collection.get(where={"video_id": str(video_id)}, include=["embeddings"])
+    if this_video_data["embeddings"] is None or len(this_video_data["embeddings"]) == 0:
+        return []
+
+    target_avg = np.mean(this_video_data["embeddings"], axis=0)
+
+    other_videos = db.query(Video).filter(Video.id != video_id, Video.status == VideoStatus.ready).all()
+
+    scored = []
+    for v in other_videos:
+        v_data = collection.get(where={"video_id": str(v.id)}, include=["embeddings"])
+        if v_data["embeddings"] is None or len(v_data["embeddings"]) == 0:
+            continue
+        v_avg = np.mean(v_data["embeddings"], axis=0)
+        score = float(np.dot(target_avg, v_avg) / (np.linalg.norm(target_avg) * np.linalg.norm(v_avg)))
+        scored.append((score, v))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top = scored[:top_k]
+
+    return [
+        {"video_id": str(v.id), "title": v.title, "category": v.category, "score": round(score, 4)}
+        for score, v in top
+    ]
 
 
 @router.get("/{video_id}/chat/history")
@@ -169,24 +248,144 @@ def chat_with_video_stream(
     if not video:
         raise HTTPException(status_code=404, detail="Video not found or not ready")
 
-    prompt, top_segments, relevant_segments = build_context_and_prompt(db, video_id, current_user.id, payload.message)
+    user_message = payload.message
+    user_id = current_user.id
+
+    intent = classify_intent(user_message)
+
+    if intent == "summarize":
+        if video.cached_summary:
+            summary_text = video.cached_summary
+        else:
+            segments = (
+                db.query(TranscriptSegment)
+                .filter(TranscriptSegment.video_id == video_id)
+                .order_by(TranscriptSegment.start_time)
+                .all()
+            )
+            if not segments:
+                summary_text = "I don't have a transcript for this video yet."
+            else:
+                full_text = " ".join(s.text for s in segments)
+                prompt = f"""Summarize this video transcript in 3-4 short sentences aimed at a student deciding whether to watch it. Be concrete about what topics are covered.
+
+Transcript:
+{full_text[:6000]}
+
+Summary:"""
+                try:
+                    summary_text = call_llm(prompt)
+                    video.cached_summary = summary_text
+                    db.commit()
+                except Exception as e:
+                    print(f"[intent-routed summary failed]: {e}")
+                    summary_text = "Sorry, I couldn't generate a summary right now. Please try again in a moment."
+
+        def generate_summary():
+            yield "META:" + json.dumps({"referenced_timestamps": []}) + "\n"
+            yield "RELATED:" + json.dumps([]) + "\n"
+            yield summary_text
+
+            save_db = SessionLocal()
+            try:
+                save_db.add(ChatMessage(user_id=user_id, video_id=video_id, role="user", text=user_message))
+                save_db.add(ChatMessage(
+                    user_id=user_id, video_id=video_id, role="assistant",
+                    text=summary_text, referenced_timestamps=json.dumps([]),
+                ))
+                save_db.commit()
+            finally:
+                save_db.close()
+
+        return StreamingResponse(generate_summary(), media_type="text/plain")
+
+    if intent == "related":
+        related = get_related_videos_data(db, video_id)
+        reply_text = "No related videos found yet." if not related else "Here's what's related:"
+
+        def generate_related():
+            yield "META:" + json.dumps({"referenced_timestamps": []}) + "\n"
+            yield "RELATED:" + json.dumps(related) + "\n"
+            yield reply_text
+
+            save_db = SessionLocal()
+            try:
+                save_db.add(ChatMessage(user_id=user_id, video_id=video_id, role="user", text=user_message))
+                save_db.add(ChatMessage(
+                    user_id=user_id, video_id=video_id, role="assistant",
+                    text=reply_text, referenced_timestamps=json.dumps([]),
+                ))
+                save_db.commit()
+            finally:
+                save_db.close()
+
+        return StreamingResponse(generate_related(), media_type="text/plain")
+
+    if intent == "suggest_questions":
+        if video.cached_suggested_questions:
+            questions = json.loads(video.cached_suggested_questions)
+        else:
+            segments = (
+                db.query(TranscriptSegment)
+                .filter(TranscriptSegment.video_id == video_id)
+                .order_by(TranscriptSegment.start_time)
+                .all()
+            )
+            questions = []
+            if segments:
+                full_text = " ".join(s.text for s in segments)
+                prompt = f"""Based on this video transcript, write exactly 3 short questions a curious viewer would naturally ask about it. Each question should be under 8 words. Return ONLY the questions, one per line, no numbering, no extra text.
+
+Transcript:
+{full_text[:6000]}
+
+Questions:"""
+                try:
+                    raw = call_llm(prompt)
+                    questions = [q.strip("- ").strip() for q in raw.strip().split("\n") if q.strip()][:3]
+                    video.cached_suggested_questions = json.dumps(questions)
+                    db.commit()
+                except Exception as e:
+                    print(f"[intent-routed suggested-questions failed]: {e}")
+
+        if questions:
+            reply_text = "Here are a few questions you could ask:\n\n" + "\n".join(f"- {q}" for q in questions)
+        else:
+            reply_text = "I don't have any suggested questions for this video yet."
+
+        def generate_suggestions():
+            yield "META:" + json.dumps({"referenced_timestamps": []}) + "\n"
+            yield "RELATED:" + json.dumps([]) + "\n"
+            yield reply_text
+
+            save_db = SessionLocal()
+            try:
+                save_db.add(ChatMessage(user_id=user_id, video_id=video_id, role="user", text=user_message))
+                save_db.add(ChatMessage(
+                    user_id=user_id, video_id=video_id, role="assistant",
+                    text=reply_text, referenced_timestamps=json.dumps([]),
+                ))
+                save_db.commit()
+            finally:
+                save_db.close()
+
+        return StreamingResponse(generate_suggestions(), media_type="text/plain")
+
+    prompt, top_segments, relevant_segments = build_context_and_prompt(db, video_id, current_user.id, user_message)
     if prompt is None:
         raise HTTPException(status_code=400, detail="This video has no transcript yet")
 
     timestamps = [s.start_time for s in relevant_segments]
-    user_message = payload.message
-    user_id = current_user.id
 
     def generate():
         yield "META:" + json.dumps({"referenced_timestamps": timestamps}) + "\n"
+        yield "RELATED:" + json.dumps([]) + "\n"
 
-        client = get_gemini_client()
         full_answer = ""
         try:
-            for chunk in client.models.generate_content_stream(model=MODEL_NAME, contents=prompt):
-                if chunk.text:
-                    full_answer += chunk.text
-                    yield chunk.text
+            for delta in stream_llm(prompt):
+                full_answer += delta
+                yield delta
         except Exception as e:
             print(f"[chat stream failed]: {e}")
             error_message = "Sorry, I couldn't answer that right now. Please try again in a moment."
@@ -255,32 +454,7 @@ def related_videos(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    collection = get_collection()
-
-    this_video_data = collection.get(where={"video_id": str(video_id)}, include=["embeddings"])
-    if this_video_data["embeddings"] is None or len(this_video_data["embeddings"]) == 0:
-        return []
-
-    target_avg = np.mean(this_video_data["embeddings"], axis=0)
-
-    other_videos = db.query(Video).filter(Video.id != video_id, Video.status == VideoStatus.ready).all()
-
-    scored = []
-    for v in other_videos:
-        v_data = collection.get(where={"video_id": str(v.id)}, include=["embeddings"])
-        if v_data["embeddings"] is None or len(v_data["embeddings"]) == 0:
-            continue
-        v_avg = np.mean(v_data["embeddings"], axis=0)
-        score = float(np.dot(target_avg, v_avg) / (np.linalg.norm(target_avg) * np.linalg.norm(v_avg)))
-        scored.append((score, v))
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-    top = scored[:top_k]
-
-    return [
-        {"video_id": str(v.id), "title": v.title, "category": v.category, "score": round(score, 4)}
-        for score, v in top
-    ]
+    return get_related_videos_data(db, video_id, top_k)
 
 
 @router.get("/{video_id}/suggested-questions")

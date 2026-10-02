@@ -99,6 +99,13 @@ export default function WatchPage() {
             return next;
           });
         },
+        onRelated: (relatedVideos) => {
+          setChatMessages((prev) => {
+            const next = [...prev];
+            next[next.length - 1] = { ...next[next.length - 1], relatedVideos };
+            return next;
+          });
+        },
         onChunk: (chunk) => {
           setChatMessages((prev) => {
             const next = [...prev];
@@ -149,16 +156,7 @@ export default function WatchPage() {
     const message = chatInput.trim();
     if (!message) return;
     setChatInput("");
-
-    const normalized = message.toLowerCase();
-
-    if (normalized.includes("summar")) {
-      await handleChip({ label: message, action: "summary" });
-    } else if (normalized.includes("related") || normalized.includes("recommend")) {
-      await handleChip({ label: message, action: "related" });
-    } else {
-      await sendQuestion(message);
-    }
+    await sendQuestion(message);
   }
 
   async function handleClearChat() {
